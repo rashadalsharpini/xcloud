@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from googleapiclient.discovery import build
 from services import gmail_service, task_service
 from services import google_calendar_service
@@ -16,8 +17,27 @@ When the user asks you to do something:
 3. If the user refers to their documents or notes, use rag_search.
 4. After getting results, summarize what you did.
 
+Date & time handling:
+- The current date and time (UTC) is provided below. Resolve relative dates like
+  "today", "tomorrow", "next Monday", "this evening" yourself into concrete
+  ISO 8601 values — do NOT ask the user for the absolute date.
+- When creating a calendar event with no explicit time, use 09:00 as the start.
+- end_time is optional; if the user doesn't give one, omit it (it defaults to
+  one hour after the start). Times are interpreted as UTC unless stated.
+- Only ask the user a clarifying question if the request is genuinely ambiguous
+  (e.g. no event title at all). Never ask for a timezone — assume UTC.
+
 Always ask for confirmation before sending emails or deleting anything important.
 When listing items, present them clearly and ask the user what they'd like to do next."""
+
+
+def _build_system_prompt() -> str:
+    now = datetime.now(timezone.utc)
+    context = (
+        f"\n\nCurrent date and time (UTC): {now.strftime('%A, %Y-%m-%d %H:%M')} "
+        f"(ISO: {now.isoformat()})."
+    )
+    return AGENT_SYSTEM_PROMPT + context
 
 TOOL_DEFINITIONS = [
     # ── Gmail tools ──
@@ -143,17 +163,17 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "create_calendar_event",
-            "description": "Create a new Google Calendar event.",
+            "description": "Create a new Google Calendar event. Resolve relative dates like 'today'/'tomorrow' to a concrete ISO date using the current date provided in the system prompt. If the user gives no time, use 09:00 for the start. end_time is optional and defaults to one hour after start_time.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string", "description": "Event title"},
-                    "start_time": {"type": "string", "description": "Start time in ISO format, e.g. '2026-06-22T14:00:00'"},
-                    "end_time": {"type": "string", "description": "End time in ISO format"},
+                    "start_time": {"type": "string", "description": "Start time in ISO 8601, e.g. '2026-06-30T09:00:00'. Date-only ('2026-06-30') is allowed for all-day events."},
+                    "end_time": {"type": "string", "description": "Optional end time in ISO 8601. Defaults to one hour after start_time if omitted."},
                     "description": {"type": "string", "description": "Optional description"},
                     "location": {"type": "string", "description": "Optional location"},
                 },
-                "required": ["summary", "start_time", "end_time"],
+                "required": ["summary", "start_time"],
             },
         },
     },
@@ -446,8 +466,15 @@ async def _execute_tool(name: str, args: dict, user, db) -> str:
             return "\n".join(lines)
 
         elif name == "create_calendar_event":
+            summary = args.get("summary") or args.get("title")
+            start_time = args.get("start_time") or args.get("start")
+            if not summary:
+                return "Missing event title (summary)."
+            if not start_time:
+                return "Missing start_time for the event."
             result = google_calendar_service.create_google_event(
-                user, args["summary"], args["start_time"], args["end_time"],
+                user, summary, start_time,
+                end_time=args.get("end_time") or args.get("end"),
                 description=args.get("description", ""),
                 location=args.get("location", ""),
             )
@@ -597,7 +624,7 @@ async def stream_agent_response(
     yield json.dumps({"type": "agent_start"}) + "\n"
 
     full_messages = (
-        [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+        [{"role": "system", "content": _build_system_prompt()}]
         + [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] in ("user", "assistant")]
         + [{"role": "user", "content": prompt}]
     )
