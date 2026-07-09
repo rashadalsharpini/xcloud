@@ -1,7 +1,7 @@
 [project]
 name = "xcloud"
-version = "0.1.0"
-description = "FastAPI wrapper for local Ollama LLM services and Faster-Whisper transcription"
+version = "0.2.0"
+description = "Multi-provider AI assistant server with Ollama, OpenAI, Alibaba Cloud, and Gemini support"
 readme = "README.md"
 requires-python = ">=3.10"
 
@@ -12,6 +12,8 @@ dependencies = [
     "python-multipart",
     "faster-whisper>=1.2.0",
     "openai-whisper>=20250625",
+    "numba>=0.60.0",
+    "llvmlite>=0.43.0",
     "ctranslate2>=4.6.1",
     "torch>=2.9.0",
     "av>=16.0.1",
@@ -26,6 +28,9 @@ dependencies = [
     "chromadb",
     "pypdf",
     "llama-index-llms-openai",
+    "llama-index-embeddings-openai",
+    "openai",
+    "google-genai",
     "ddgs",
     "sqlalchemy",
     "aiosqlite",
@@ -39,7 +44,8 @@ dependencies = [
     "google-auth-httplib2",
     "google-auth-oauthlib",
     "nvidia-cudnn-cu12",
-    "nvidia-cublas-cu12"
+    "nvidia-cublas-cu12",
+    "mcp"
 ]
 
   

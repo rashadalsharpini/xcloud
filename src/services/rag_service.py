@@ -1,15 +1,59 @@
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core import SimpleDirectoryReader
+from llama_index.core import Document as LIDocument
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from chromadb import PersistentClient
 from os import path
 
-# Initialize embedding model (using your local Ollama)
-embed_model = OllamaEmbedding(
-    model_name="nomic-embed-text:latest",
-    base_url="http://localhost:11434",
-)
+
+def _get_embed_model():
+    """Build the embedding model from settings."""
+    import json, os
+
+    settings_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "settings.json")
+    )
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except Exception:
+        settings = {}
+
+    emb = settings.get("embedding", {})
+    emb_provider = emb.get("provider", "ollama")
+    emb_model_name = emb.get("model", "nomic-embed-text:latest")
+
+    if emb_provider == "ollama":
+        providers = settings.get("providers", {})
+        ollama_cfg = providers.get("ollama", {})
+        base_url = ollama_cfg.get("base_url", "http://localhost:11434")
+        return OllamaEmbedding(
+            model_name=emb_model_name,
+            base_url=base_url,
+        )
+
+    if emb_provider in ("openai", "alibaba"):
+        from llama_index.embeddings.openai import OpenAIEmbedding
+        providers = settings.get("providers", {})
+        cfg = providers.get(emb_provider, {})
+        api_key = cfg.get("api_key", "")
+        base_url = cfg.get("base_url", "https://api.openai.com/v1")
+        return OpenAIEmbedding(
+            model_name=emb_model_name,
+            api_key=api_key,
+            api_base=base_url,
+        )
+
+    # Fallback: local Ollama
+    return OllamaEmbedding(
+        model_name="nomic-embed-text:latest",
+        base_url="http://localhost:11434",
+    )
+
+
+# Initialize embedding model (lazy - built on first use via _get_embed_model)
+embed_model = None
 
 # Initialize ChromaDB client
 chroma_client = PersistentClient(path="./.chroma_db")
@@ -18,10 +62,15 @@ current_index = None
 current_collection_name = None
 
 
-
-
 class IndexingCancelled(Exception):
     """Raised when an indexing job is cancelled mid-run."""
+
+
+def _ensure_embed_model():
+    global embed_model
+    if embed_model is None:
+        embed_model = _get_embed_model()
+    return embed_model
 
 
 def _extract_pdf_text(file_path: str) -> str:
@@ -49,7 +98,6 @@ def _read_documents(folder_path: str, check=None):
     metadata so the UI can list source files.
     """
     import os
-    from llama_index.core import Document
 
     supported = {".txt", ".md", ".pdf"}
 
@@ -75,10 +123,9 @@ def _read_documents(folder_path: str, check=None):
                 continue
 
             if not text:
-                # No extractable text (e.g. image-only PDF) — skip.
                 continue
 
-            yield Document(
+            yield LIDocument(
                 text=text,
                 metadata={
                     "file_name": name,
@@ -113,6 +160,8 @@ def create_index_from_folder_cancellable(
 
     from llama_index.core.node_parser import SentenceSplitter
 
+    embed = _ensure_embed_model()
+
     def cancelled() -> bool:
         return bool(is_cancelled and is_cancelled())
 
@@ -129,9 +178,6 @@ def create_index_from_folder_cancellable(
 
     splitter = SentenceSplitter()
 
-    # Phase 1 — read each supported file with a proper extractor (pypdf for
-    # PDFs, UTF-8 for text), one at a time so cancellation can interrupt a
-    # huge folder, then split into nodes to know the real total up front.
     all_nodes = []
     docs_indexed = 0
     for doc in _read_documents(folder_path, check):
@@ -149,7 +195,6 @@ def create_index_from_folder_cancellable(
     if on_progress:
         on_progress(0, total)
 
-    # Build the (empty) index/collection.
     try:
         chroma_client.delete_collection(name=collection_name)
     except Exception:
@@ -161,21 +206,19 @@ def create_index_from_folder_cancellable(
     index = VectorStoreIndex(
         nodes=[],
         storage_context=storage_context,
-        embed_model=embed_model,
+        embed_model=embed,
     )
 
     if on_phase:
         on_phase("embedding")
 
-    # Phase 2 — embed in batches (faster than one-by-one), cancel-checking
-    # between batches so the job still stops quickly.
     BATCH = 16
     nodes_done = 0
     try:
         for start in range(0, total, BATCH):
             check()
             batch = all_nodes[start:start + BATCH]
-            index.insert_nodes(batch)  # embeds + writes to Chroma
+            index.insert_nodes(batch)
             nodes_done += len(batch)
             if on_progress:
                 on_progress(nodes_done, total)
@@ -203,13 +246,15 @@ def load_existing_index(collection_name: str = "default"):
     """
     global current_index, current_collection_name
 
+    embed = _ensure_embed_model()
+
     try:
         chroma_collection = chroma_client.get_collection(name=collection_name)
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 
         current_index = VectorStoreIndex.from_vector_store(
             vector_store=vector_store,
-            embed_model=embed_model,
+            embed_model=embed,
         )
 
         current_collection_name = collection_name
@@ -229,7 +274,6 @@ def get_context_for_llm(question: str, top_k: int = 3):
     retriever = current_index.as_retriever(similarity_top_k=top_k)
     nodes = retriever.retrieve(question)
 
-    # Combine all relevant text
     context_parts = []
     sources = []
 
@@ -246,24 +290,18 @@ def get_context_for_llm(question: str, top_k: int = 3):
             "file_path": meta.get("file_path"),
             "text": node.node.text[:200] + "...",
             "score": node.score,
-            "metadata": meta,  # Contains file path, etc.
+            "metadata": meta,
         })
 
     return "\n".join(context_parts), sources
 
 
 def list_collections():
-    """
-    List all available collections in ChromaDB.
-    """
     collections = chroma_client.list_collections()
     return [{"name": col.name, "count": col.count()} for col in collections]
 
 
 def get_current_collection_info():
-    """
-    Get info about the currently loaded collection.
-    """
     if current_index is None:
         return {"status": "No collection loaded"}
 
@@ -274,10 +312,6 @@ def get_current_collection_info():
 
 
 def delete_collection(collection_name: str):
-    """
-    Delete a collection from ChromaDB. If it is the active one, clear the
-    in-memory active index too.
-    """
     global current_index, current_collection_name
 
     try:
@@ -300,10 +334,6 @@ def delete_collection(collection_name: str):
 
 
 def get_collection_files(collection_name: str):
-    """
-    Return the distinct source files indexed in a collection, read from the
-    stored chunk metadata (file_name / file_path).
-    """
     try:
         existing = {c.name for c in chroma_client.list_collections()}
         if collection_name not in existing:
@@ -337,10 +367,6 @@ def get_collection_files(collection_name: str):
 
 
 def get_collection_source_folder(collection_name: str):
-    """
-    Best-effort recovery of the folder a collection was indexed from, by
-    taking the common parent directory of the stored file paths.
-    """
     import os
 
     info = get_collection_files(collection_name)
@@ -354,7 +380,6 @@ def get_collection_source_folder(collection_name: str):
         folder = os.path.dirname(paths[0])
     else:
         folder = os.path.commonpath(paths)
-        # commonpath may return a file if all share it; ensure it's a dir.
         if not os.path.isdir(folder):
             folder = os.path.dirname(folder)
 

@@ -1,11 +1,11 @@
 import json
 from googleapiclient.discovery import build
-from ollama import AsyncClient
 from services import gmail_service, task_service
 from services import google_calendar_service
 from services import google_tasks_service as gtasks_service
 from services import search_service, rag_service
 from services.google_auth_service import get_google_credentials
+from services.providers import get_current_provider
 
 AGENT_SYSTEM_PROMPT = """You are Xcloud, an AI assistant with access to Google services, web search, and local documents.
 You can read and send emails, manage calendar events, handle tasks, search the web, and look up indexed documents.
@@ -610,17 +610,17 @@ async def stream_agent_response(
         response_content = ""
         tool_calls = None
 
-        async for part in await AsyncClient().chat(
+        provider = get_current_provider()
+
+        async for chunk in provider.chat_stream(
             model=model,
             messages=full_messages,
             tools=TOOL_DEFINITIONS,
-            stream=True,
         ):
-            msg = part.get("message", {})
-            if msg.get("tool_calls"):
-                tool_calls = msg["tool_calls"]
-            if msg.get("content"):
-                response_content += msg["content"]
+            if chunk.get("tool_calls"):
+                tool_calls = chunk["tool_calls"]
+            if chunk.get("content"):
+                response_content += chunk["content"]
 
         if not tool_calls:
             yield json.dumps({"type": "content", "content": response_content}) + "\n"
