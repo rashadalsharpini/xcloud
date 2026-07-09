@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from services import llm_service, whisper, rag_service, search_service
 from services import chat_service, auth_service
+from services.providers import get_available_providers
 from Data.models import User, Chat as ChatModel
 from Data.database import get_db
 import os
@@ -19,7 +20,7 @@ router = APIRouter()
 
 @router.get("/models")
 async def list_models():
-    """List available Ollama models."""
+    """List available models from the current provider."""
     return llm_service.get_available_models()
 
 
@@ -32,7 +33,7 @@ async def default_model():
 
 @router.get("/settings")
 async def get_settings():
-    """Return full settings (including default_model)."""
+    """Return full settings (without secrets)."""
     return llm_service.get_settings()
 
 
@@ -40,6 +41,50 @@ async def get_settings():
 async def suggested_prompts(category: str = None):
     """Get suggested prompts for the user."""
     return llm_service.get_suggested_prompts(category)
+
+
+# ---------------------------------------------------------------------------
+# Provider management (authenticated)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/providers")
+async def list_providers():
+    """List available providers with their config status."""
+    return get_available_providers()
+
+
+@router.post("/providers/set")
+async def set_provider(
+    provider: str = Query(..., description="Provider name: ollama, openai, alibaba, gemini"),
+    user: User = Depends(auth_service.get_current_user),
+):
+    """Switch the active LLM provider."""
+    from services.providers import REGISTRY
+    if provider not in REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Available: {list(REGISTRY)}")
+    settings = llm_service.set_active_provider(provider)
+    return {"message": f"Switched to provider '{provider}'", "settings": settings}
+
+
+@router.post("/providers/config")
+async def configure_provider(
+    provider: str = Query(...),
+    api_key: str = Query(""),
+    base_url: str = Query(""),
+    user: User = Depends(auth_service.get_current_user),
+):
+    """Configure a provider's API key and/or base URL."""
+    from services.providers import REGISTRY
+    if provider not in REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'")
+    config = {}
+    if api_key:
+        config["api_key"] = api_key
+    if base_url:
+        config["base_url"] = base_url
+    llm_service.save_provider_config(provider, config)
+    return {"message": f"Configuration updated for '{provider}'"}
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +137,12 @@ async def set_model(
         if isinstance(available, dict) and "error" in available:
             raise HTTPException(
                 status_code=503,
-                detail=f"Cannot reach Ollama: {available['error']}. Make sure Ollama is running.",
+                detail=f"Cannot reach provider: {available['error']}",
             )
         if name not in available:
             raise HTTPException(
                 status_code=400,
-                detail=f"Model '{name}' is not installed. Available models: {available}",
+                detail=f"Model '{name}' is not available. Available models: {available}",
             )
     llm_service.save_default_model(name)
     resolved = llm_service.get_default_model()
@@ -285,7 +330,7 @@ async def chat(
         if m["role"] in ("user", "assistant")
     ]
 
-    # Set context (FIXED: set on the session instance, not module)
+    # Set context
     if context_parts:
         llm_session.extra_context = "\n\n".join(context_parts)
 
@@ -294,14 +339,11 @@ async def chat(
 
     # Stream response
     async def stream_with_metadata():
-        # Send chat_id so the client knows which chat this belongs to
         yield json.dumps({"type": "chat_id", "data": chat_id}) + "\n"
 
-        # Send sources as first event
         if sources:
             yield json.dumps({"type": "sources", "data": sources}) + "\n"
 
-        # Stream LLM response, collecting full reply and thinking
         full_reply = ""
         full_thinking = ""
 
@@ -312,7 +354,6 @@ async def chat(
             elif parsed["type"] == "thinking":
                 full_thinking += parsed["content"]
             elif parsed["type"] == "done":
-                # Save assistant message to DB with thinking
                 chat_service.add_message(
                     db,
                     chat_id,
