@@ -55,7 +55,7 @@ def get_provider(name: str, config: dict | None = None) -> LLMProvider:
 def get_current_provider() -> LLMProvider:
     """Shortcut: read the active provider from settings and return an instance."""
     from ..llm_service import get_settings
-    settings = get_settings()
+    settings = get_settings(include_secrets=True)
     name = settings.get("provider", "ollama")
     provider_config = settings.get("providers", {}).get(name, {})
     return get_provider(name, provider_config)

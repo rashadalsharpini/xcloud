@@ -133,16 +133,19 @@ async def set_model(
 ):
     """Set the default model. Use 'auto' to reset to auto-detection."""
     if name != "auto":
-        available = llm_service.get_available_models()
-        if isinstance(available, dict) and "error" in available:
+        from services.providers import get_current_provider
+
+        try:
+            supported = get_current_provider().is_model_supported(name)
+        except Exception as e:
             raise HTTPException(
                 status_code=503,
-                detail=f"Cannot reach provider: {available['error']}",
+                detail=f"Cannot reach provider: {e}",
             )
-        if name not in available:
+        if not supported:
             raise HTTPException(
                 status_code=400,
-                detail=f"Model '{name}' is not available. Available models: {available}",
+                detail=f"Model '{name}' is not available on the current provider.",
             )
     llm_service.save_default_model(name)
     resolved = llm_service.get_default_model()
@@ -250,6 +253,7 @@ async def export_chat(
 async def chat(
     prompt: str,
     chat_id: str = None,
+    model: str = None,
     use_rag: bool = False,
     use_web_search: bool = False,
     think: bool = False,
@@ -262,6 +266,7 @@ async def chat(
     Chat with LLM, optionally using RAG context and/or web search.
 
     - chat_id: If provided, continues an existing chat. Otherwise creates a new one.
+    - model: Override the model for this request (falls back to chat/default).
     - use_rag: Enrich prompt with local document context from ChromaDB.
     - use_web_search: Search the web and inject results as context.
     - think: Enable extended thinking (model must support it).
@@ -278,7 +283,14 @@ async def chat(
 
     # Get the chat's model
     chat_record = db.query(ChatModel).filter(ChatModel.id == chat_id).first()
-    model = chat_record.model if chat_record else llm_service.session.model
+    resolved_model = llm_service.resolve_model(
+        model or (chat_record.model if chat_record else None)
+    )
+    # Keep the chat pinned to the model actually used so the picker stays honest.
+    if chat_record and chat_record.model != resolved_model:
+        chat_record.model = resolved_model
+        db.commit()
+    model = resolved_model
 
     sources = []
     context_parts = []
@@ -347,21 +359,32 @@ async def chat(
         full_reply = ""
         full_thinking = ""
 
-        async for chunk_json in llm_session.stream(prompt, think=think):
-            parsed = json.loads(chunk_json)
-            if parsed["type"] == "content":
-                full_reply += parsed["content"]
-            elif parsed["type"] == "thinking":
-                full_thinking += parsed["content"]
-            elif parsed["type"] == "done":
-                chat_service.add_message(
-                    db,
-                    chat_id,
-                    "assistant",
-                    full_reply,
-                    thinking=full_thinking if full_thinking else None,
-                )
-            yield chunk_json
+        try:
+            async for chunk_json in llm_session.stream(prompt, think=think):
+                parsed = json.loads(chunk_json)
+                if parsed["type"] == "content":
+                    full_reply += parsed["content"]
+                elif parsed["type"] == "thinking":
+                    full_thinking += parsed["content"]
+                elif parsed["type"] == "done":
+                    chat_service.add_message(
+                        db,
+                        chat_id,
+                        "assistant",
+                        full_reply,
+                        thinking=full_thinking if full_thinking else None,
+                    )
+                yield chunk_json
+        except Exception as e:
+            # Surface the real reason to the client instead of dropping the
+            # connection (which the UI can only report as a network error).
+            if full_reply:
+                chat_service.add_message(db, chat_id, "assistant", full_reply)
+            yield json.dumps({
+                "type": "error",
+                "message": llm_service.friendly_error(e),
+                "model": llm_session.model,
+            }) + "\n"
 
     return StreamingResponse(stream_with_metadata(), media_type="text/event-stream")
 

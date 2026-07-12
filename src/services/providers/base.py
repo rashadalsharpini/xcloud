@@ -48,3 +48,8 @@ class LLMProvider(ABC):
     def get_chat_models(self) -> list[str]:
         """Return only chat-capable models (override if provider distinguishes)."""
         return self.list_models()
+
+    def is_model_supported(self, model: str) -> bool:
+        """Whether this provider can serve `model` (override for providers
+        whose `list_models()` is curated rather than exhaustive)."""
+        return model in self.list_models()

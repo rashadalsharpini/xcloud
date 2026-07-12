@@ -1,9 +1,31 @@
+import asyncio
+import re
 from typing import AsyncIterator
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
 from .base import LLMProvider
+
+# Transient upstream failures worth retrying: overloaded (503) and
+# rate-limited (429). Non-transient errors (400/401/404) fail immediately.
+_RETRYABLE_CODES = {429, 503}
+_MAX_ATTEMPTS = 3
+_BACKOFF_SECONDS = (2, 5)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    return (
+        isinstance(exc, genai_errors.APIError)
+        and getattr(exc, "code", None) in _RETRYABLE_CODES
+    )
+
+# Only expose stable, chat-usable Gemini models to the UI. Google's list API
+# returns dozens of variants (previews, experiments, dated snapshots, aqa,
+# imagen, deep-research, ...) which are confusing and often not usable for
+# plain generateContent chat.
+_CHAT_MODEL_RE = re.compile(r"^gemini-\d+(\.\d+)?-(pro|flash)(-lite)?$")
 
 
 class GeminiProvider(LLMProvider):
@@ -95,13 +117,47 @@ class GeminiProvider(LLMProvider):
 
         config = genai_types.GenerateContentConfig(tools=gemini_tools) if gemini_tools else None
 
-        response = self._client.models.generate_content_stream(
-            model=model,
-            contents=gemini_messages,
-            config=config,
-        )
+        # Retry transient upstream failures (503 overloaded / 429 rate limit),
+        # but only before any content has been yielded — never mid-stream.
+        response = None
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                response = self._client.models.generate_content_stream(
+                    model=model,
+                    contents=gemini_messages,
+                    config=config,
+                )
+                break
+            except Exception as e:
+                if attempt < _MAX_ATTEMPTS - 1 and _is_retryable(e):
+                    await asyncio.sleep(_BACKOFF_SECONDS[attempt])
+                    continue
+                raise
 
-        for chunk in response:
+        chunk_iter = iter(response)
+        first_chunk = None
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                first_chunk = next(chunk_iter, None)
+                break
+            except Exception as e:
+                if attempt < _MAX_ATTEMPTS - 1 and _is_retryable(e):
+                    await asyncio.sleep(_BACKOFF_SECONDS[attempt])
+                    response = self._client.models.generate_content_stream(
+                        model=model,
+                        contents=gemini_messages,
+                        config=config,
+                    )
+                    chunk_iter = iter(response)
+                    continue
+                raise
+
+        def chunks():
+            if first_chunk is not None:
+                yield first_chunk
+            yield from chunk_iter
+
+        for chunk in chunks():
             chunk_out = {}
             if chunk.text:
                 chunk_out["content"] = chunk.text
@@ -138,21 +194,56 @@ class GeminiProvider(LLMProvider):
 
         config = genai_types.GenerateContentConfig(tools=gemini_tools) if gemini_tools else None
 
-        response = self._client.models.generate_content(
-            model=model,
-            contents=gemini_messages,
-            config=config,
-        )
-        return response.text or ""
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                response = self._client.models.generate_content(
+                    model=model,
+                    contents=gemini_messages,
+                    config=config,
+                )
+                return response.text or ""
+            except Exception as e:
+                if attempt < _MAX_ATTEMPTS - 1 and _is_retryable(e):
+                    await asyncio.sleep(_BACKOFF_SECONDS[attempt])
+                    continue
+                raise
+        return ""
 
     def list_models(self) -> list[str]:
+        """Return the curated chat model list (what the UI should show)."""
+        return self.get_chat_models()
+
+    def get_chat_models(self) -> list[str]:
+        """Only stable `gemini-X-pro/flash(-lite)` models, newest first."""
         try:
             models = self._client.models.list()
-            return sorted(m.name.replace("models/", "") for m in models)
         except Exception:
             return []
 
-    def get_chat_models(self) -> list[str]:
-        """Gemini lists all models; filter to chat-capable ones."""
-        all_models = self.list_models()
-        return [m for m in all_models if "embedding" not in m.lower()]
+        names = {
+            m.name.replace("models/", "")
+            for m in models
+            if "generateContent" in (m.supported_actions or [])
+        }
+        curated = [n for n in names if _CHAT_MODEL_RE.match(n)]
+
+        def sort_key(name: str) -> tuple:
+            version = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+            v = float(version.group(1)) if version else 0.0
+            tier = 0 if "-pro" in name else 1 if "-lite" not in name else 2
+            return (-v, tier)
+
+        return sorted(curated, key=sort_key)
+
+    def is_model_supported(self, model: str) -> bool:
+        """Accept any generateContent-capable model, not just curated ones,
+        so power users can pin e.g. a preview model as their default."""
+        try:
+            models = self._client.models.list()
+            return any(
+                m.name.replace("models/", "") == model
+                and "generateContent" in (m.supported_actions or [])
+                for m in models
+            )
+        except Exception:
+            return False
