@@ -180,6 +180,7 @@ class CalendarEvent(Base):
     location = Column(String(512), nullable=True)
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=False)
+    color = Column(String(32), nullable=True)
     google_event_id = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 from .providers import get_current_provider, get_provider
@@ -118,6 +119,54 @@ def _auto_pull_ollama_model() -> str | None:
         print(f"Failed to pull models: {e}")
 
     return None
+
+
+def resolve_model(preferred: str | None) -> str:
+    """
+    Return `preferred` if the active provider actually serves it, otherwise
+    fall back to the provider's default model.
+
+    Chats persist the model they were created with, so after switching
+    providers a stored model (e.g. an Ollama model) may not exist on the new
+    provider (e.g. Gemini). Passing it through would 404 mid-stream.
+    """
+    if preferred:
+        try:
+            if get_current_provider().is_model_supported(preferred):
+                return preferred
+        except Exception:
+            pass
+    return get_default_model() or ""
+
+
+def friendly_error(exc: Exception) -> str:
+    """
+    Compress provider exceptions into a short, human-readable message for the
+    chat UI (raw payloads can be hundreds of characters of JSON).
+    """
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code == 429:
+        return (
+            "The model is rate-limited or out of quota. "
+            "Try again in a minute, pick another model, or check your plan/billing."
+        )
+    if code == 503:
+        return (
+            "The model is overloaded right now (provider-side). "
+            "Please try again in a few seconds."
+        )
+    if code in (401, 403):
+        return "The provider rejected the API key. Check the provider configuration."
+    if code == 404:
+        return "The selected model is not available on this provider. Pick another model."
+
+    # Fall back to the exception's own message, truncated.
+    msg = str(exc)
+    # google-genai errors embed a JSON blob; prefer its 'message' field.
+    m = re.search(r"'message': '([^']+)'", msg)
+    if m:
+        msg = m.group(1)
+    return msg[:300]
 
 
 def save_default_model(model_name: str) -> dict:

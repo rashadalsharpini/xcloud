@@ -5,7 +5,7 @@ Reminder service — create, list, delete reminders and fire due ones.
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
-from Data.models import Reminder, Task
+from Data.models import Reminder, Task, CalendarEvent
 from Data.database import SessionLocal
 from services import notification_service
 
@@ -17,11 +17,14 @@ def create_reminder(
     remind_at: datetime,
 ) -> dict:
     """Create a reminder for a task."""
-    # Verify the task exists and belongs to the user
+    # Verify the task or calendar event exists and belongs to the user
     task = db.query(Task).filter(Task.id == task_id,
                                  Task.user_id == user_id).first()
     if not task:
-        raise ValueError("Task not found")
+        event = db.query(CalendarEvent).filter(CalendarEvent.id == task_id,
+                                               CalendarEvent.user_id == user_id).first()
+        if not event:
+            raise ValueError("Task or Calendar Event not found")
 
     reminder = Reminder(
         task_id=task_id,
@@ -73,7 +76,11 @@ def check_and_fire_due_reminders():
         )
         for reminder in due_reminders:
             task = db.query(Task).filter(Task.id == reminder.task_id).first()
-            task_title = task.title if task else "Unknown Task"
+            if task:
+                task_title = task.title
+            else:
+                event = db.query(CalendarEvent).filter(CalendarEvent.id == reminder.task_id).first()
+                task_title = event.title if event else "Unknown Task"
 
             notification_service.create_notification(
                 db,
